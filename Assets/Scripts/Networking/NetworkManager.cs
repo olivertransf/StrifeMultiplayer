@@ -20,6 +20,8 @@ public class NetworkGameManager : MonoBehaviour
     [SerializeField] private Transform[] spawnPoints;
     [SerializeField] private Color[] playerColors = { Color.red, Color.blue };
     
+
+    
     [Header("UI References")]
     [SerializeField] private GameObject hostButton;
     [SerializeField] private GameObject clientButton;
@@ -64,7 +66,6 @@ public class NetworkGameManager : MonoBehaviour
             #endif
             
             await AuthenticationService.Instance.SignInAnonymouslyAsync();
-            Debug.Log($"Authentication successful. Player ID: {AuthenticationService.Instance.PlayerId}");
         }
         catch (System.Exception e)
         {
@@ -88,7 +89,6 @@ public class NetworkGameManager : MonoBehaviour
         // Force complete shutdown and wait
         if (networkManager.IsClient || networkManager.IsHost)
         {
-            Debug.Log("Force disconnecting before starting host...");
             networkManager.Shutdown();
             
             // Wait for shutdown to complete
@@ -117,7 +117,6 @@ public class NetworkGameManager : MonoBehaviour
         // Force complete shutdown and wait
         if (networkManager.IsClient || networkManager.IsHost)
         {
-            Debug.Log("Force disconnecting before starting client...");
             networkManager.Shutdown();
             
             // Wait for shutdown to complete
@@ -133,8 +132,6 @@ public class NetworkGameManager : MonoBehaviour
         }
         
         string codeToJoin = joinCodeInput.text.Trim();
-        Debug.Log($"Client: Input field contains: '{codeToJoin}'");
-        Debug.Log($"Client: Input field length: {codeToJoin.Length}");
         
         await JoinRelay(codeToJoin);
     }
@@ -157,13 +154,9 @@ public class NetworkGameManager : MonoBehaviour
     {
         try
         {
-            Debug.Log("Host: Creating relay allocation...");
             Allocation allocation = await RelayService.Instance.CreateAllocationAsync(maxPlayers);
-            Debug.Log($"Host: Allocation created with ID: {allocation.AllocationId}");
             
-            Debug.Log("Host: Getting join code...");
             joinCode = await RelayService.Instance.GetJoinCodeAsync(allocation.AllocationId);
-            Debug.Log($"Host: Join code received: {joinCode}");
             
             // Configure NetworkManager to use Relay (Host)
             var transport = networkManager.GetComponent<UnityTransport>();
@@ -175,19 +168,6 @@ public class NetworkGameManager : MonoBehaviour
                 allocation.ConnectionData
             );
             
-            Debug.Log($"Host: Connection data length: {allocation.ConnectionData.Length}");
-            Debug.Log($"Host: Connection data (first 10 bytes): {BitConverter.ToString(allocation.ConnectionData.Take(10).ToArray())}");
-            
-            Debug.Log($"Host: Relay configured - IP: {allocation.RelayServer.IpV4}, Port: {allocation.RelayServer.Port}");
-            Debug.Log($"Host: Allocation ID: {allocation.AllocationId}");
-            Debug.Log($"Host: Key length: {allocation.Key.Length}, Connection data length: {allocation.ConnectionData.Length}");
-            Debug.Log($"Host: IsHost flag set to: true");
-            Debug.Log($"Host: Join code for this allocation: {joinCode}");
-            Debug.Log($"Host: Allocation ID: {allocation.AllocationId}");
-            Debug.Log($"Host: Key length: {allocation.Key.Length}, Connection data length: {allocation.ConnectionData.Length}");
-            
-            Debug.Log("Host: Relay server data configured, starting host...");
-            
             // Start the host
             networkManager.StartHost();
             
@@ -197,19 +177,14 @@ public class NetworkGameManager : MonoBehaviour
                 joinCodeText.text = $"Join Code: {joinCode}";
             }
             
-            Debug.Log($"=== HOST JOIN CODE === {joinCode} ===");
-            Debug.Log($"Copy this exact code: {joinCode}");
-            Debug.Log($"Code length: {joinCode.Length} characters");
-            
             // Try to copy to clipboard if possible
             try
             {
                 GUIUtility.systemCopyBuffer = joinCode;
-                Debug.Log("Join code copied to clipboard!");
             }
             catch
             {
-                Debug.Log("Could not copy to clipboard automatically");
+                // Could not copy to clipboard
             }
             
             UpdateUI();
@@ -217,7 +192,6 @@ public class NetworkGameManager : MonoBehaviour
         catch (System.Exception e)
         {
             Debug.LogError($"Failed to create relay: {e.Message}");
-            Debug.LogError($"Exception details: {e}");
         }
     }
     
@@ -225,15 +199,7 @@ public class NetworkGameManager : MonoBehaviour
     {
         try
         {
-            Debug.Log($"Client: Attempting to join relay with code: '{joinCode}'");
-            Debug.Log($"Client: Join code length: {joinCode.Length} characters");
-            
             JoinAllocation allocation = await RelayService.Instance.JoinAllocationAsync(joinCode);
-            
-            Debug.Log($"Client: Successfully joined relay allocation");
-            Debug.Log($"Client: Relay IP: {allocation.RelayServer.IpV4}, Port: {allocation.RelayServer.Port}");
-            Debug.Log($"Client: Allocation ID: {allocation.AllocationId}");
-            Debug.Log($"Client: Join code used: {joinCode}");
             
             // Configure NetworkManager to use Relay (Client)
             var transport = networkManager.GetComponent<UnityTransport>();
@@ -246,38 +212,14 @@ public class NetworkGameManager : MonoBehaviour
                 allocation.HostConnectionData
             );
             
-            Debug.Log($"Client: Connection data length: {allocation.ConnectionData.Length}");
-            Debug.Log($"Client: Connection data (first 10 bytes): {BitConverter.ToString(allocation.ConnectionData.Take(10).ToArray())}");
-            Debug.Log($"Client: Host connection data length: {allocation.HostConnectionData.Length}");
-            Debug.Log($"Client: Host connection data (first 10 bytes): {BitConverter.ToString(allocation.HostConnectionData.Take(10).ToArray())}");
-            
-            Debug.Log($"Client: IsHost flag set to: false");
-            
-            Debug.Log("Client: Relay server data configured, starting client...");
-            
-            // Check network manager state before starting
-            Debug.Log($"Client: NetworkManager state before StartClient - IsClient: {networkManager.IsClient}, IsHost: {networkManager.IsHost}, IsServer: {networkManager.IsServer}");
-            Debug.Log($"Client: NetworkManager is listening: {networkManager.IsListening}");
-            
-            // Start the client
-            Debug.Log("Client: About to call networkManager.StartClient()");
             try
             {
                 networkManager.StartClient();
-                Debug.Log("Client: networkManager.StartClient() completed");
-                
-                // Check state after StartClient
-                Debug.Log($"Client: After StartClient - IsClient: {networkManager.IsClient}, IsHost: {networkManager.IsHost}, IsServer: {networkManager.IsServer}");
-                Debug.Log($"Client: After StartClient - IsListening: {networkManager.IsListening}");
-                Debug.Log($"Client: After StartClient - IsConnectedClient: {networkManager.IsConnectedClient}");
-                
-                // Start monitoring connection status
                 StartCoroutine(MonitorClientConnection());
             }
             catch (System.Exception e)
             {
                 Debug.LogError($"Client: Exception during StartClient: {e.Message}");
-                Debug.LogError($"Client: Exception details: {e}");
             }
             
             UpdateUI();
@@ -285,28 +227,28 @@ public class NetworkGameManager : MonoBehaviour
         catch (System.Exception e)
         {
             Debug.LogError($"Client: Failed to join relay: {e.Message}");
-            Debug.LogError($"Client: Join code used: '{joinCode}'");
-            Debug.LogError($"Client: Exception details: {e}");
         }
     }
     
     // Network Event Handlers
     private void OnServerStarted()
     {
-        Debug.Log("Server started successfully!");
+        Debug.Log("NetworkManager: OnServerStarted called");
         spawnedClients.Clear(); // Clear spawn tracking when server starts
         activePlayers.Clear(); // Clear active players tracking
+        
+        // SpinManager is now placed in the scene as a singleton, no need to spawn it dynamically
+        Debug.Log("NetworkManager: SpinManager should be in scene as singleton");
+        
+        // Notify MoneyUI that the game has started
+        NotifyGameStarted();
     }
     
     private void OnClientConnected(ulong clientId)
     {
-        Debug.Log($"Client connected with ID: {clientId}");
-        Debug.Log($"IsServer: {networkManager.IsServer}, IsHost: {networkManager.IsHost}, IsClient: {networkManager.IsClient}");
-        
         // If this is the server, spawn a player for the connected client
         if (networkManager.IsServer)
         {
-            Debug.Log($"Server spawning player for client {clientId}");
             // Check if we already spawned for this client
             if (!spawnedClients.Contains(clientId))
             {
@@ -316,25 +258,15 @@ public class NetworkGameManager : MonoBehaviour
                     SpawnPlayer(clientId);
                     spawnedClients.Add(clientId);
                 }
-                else
-                {
-                    Debug.Log($"Client {clientId} already has a player object");
-                }
-            }
-            else
-            {
-                Debug.Log($"Already spawned for client {clientId}");
             }
         }
-        else
-        {
-            Debug.Log("This is not the server, so not spawning player");
-        }
+        
+        // Notify MoneyUI that the game has started (for clients)
+        NotifyGameStarted();
     }
     
     private void OnClientDisconnected(ulong clientId)
     {
-        Debug.Log($"Client disconnected with ID: {clientId}");
         spawnedClients.Remove(clientId); // Remove from tracking
         activePlayers.Remove(clientId); // Remove from active players
         UpdateUI();
@@ -347,8 +279,6 @@ public class NetworkGameManager : MonoBehaviour
     
     private System.Collections.IEnumerator MonitorClientConnection()
     {
-        Debug.Log("Client: Starting connection monitoring...");
-        
         float timeout = 10f; // 10 second timeout
         float elapsed = 0f;
         
@@ -357,11 +287,8 @@ public class NetworkGameManager : MonoBehaviour
             yield return new WaitForSeconds(0.5f);
             elapsed += 0.5f;
             
-            Debug.Log($"Client: Connection check {elapsed}s - IsClient: {networkManager.IsClient}, IsConnectedClient: {networkManager.IsConnectedClient}, ConnectedClients: {networkManager.ConnectedClients.Count}");
-            
             if (networkManager.IsConnectedClient)
             {
-                Debug.Log("Client: Successfully connected to host!");
                 yield break;
             }
         }
@@ -372,8 +299,6 @@ public class NetworkGameManager : MonoBehaviour
     // Spawn a player for the given client
     private void SpawnPlayer(ulong clientId)
     {
-        Debug.Log($"SpawnPlayer called for client {clientId}");
-        
         if (spawnPoints.Length == 0)
         {
             Debug.LogError("No spawn points configured!");
@@ -405,15 +330,11 @@ public class NetworkGameManager : MonoBehaviour
             return;
         }
         
-        Debug.Log($"Spawning player object for client {clientId} at position {spawnPosition}");
-        
         // Set ownership to the client
         networkObject.SpawnAsPlayerObject(clientId);
         
         // Track the active player
         activePlayers[clientId] = networkObject;
-        
-        Debug.Log($"Player spawned successfully for client {clientId}");
         
         // Set player color based on client ID using RPC for network sync
         SetPlayerColorServerRpc(clientId, (int)clientId);
@@ -486,5 +407,18 @@ public class NetworkGameManager : MonoBehaviour
         }
         
         return 0;
+    }
+    
+    private void NotifyGameStarted()
+    {
+        // Find all MoneyUI components and notify them that the game has started
+        MoneyUI[] moneyUIs = FindObjectsOfType<MoneyUI>();
+        foreach (MoneyUI moneyUI in moneyUIs)
+        {
+            if (moneyUI != null)
+            {
+                moneyUI.OnGameStarted();
+            }
+        }
     }
 } 
