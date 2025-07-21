@@ -2,6 +2,7 @@ using UnityEngine;
 using UnityEngine.Tilemaps;
 using Unity.Netcode;
 using System.Collections;
+using System.Collections.Generic;
 
 public class PlayerMovement : NetworkBehaviour
 {
@@ -13,6 +14,11 @@ public class PlayerMovement : NetworkBehaviour
     // Network variables to sync position across clients
     private NetworkVariable<int> currentPathIndex = new NetworkVariable<int>(0);
     private NetworkVariable<bool> isMoving = new NetworkVariable<bool>(false);
+    
+    // New segment-based variables
+    private NetworkVariable<int> currentSegmentId = new NetworkVariable<int>(-1); // -1 means no segment
+    private NetworkVariable<int> currentSegmentIndex = new NetworkVariable<int>(0);
+    private NetworkVariable<bool> waitingForPathChoice = new NetworkVariable<bool>(false);
     
     // Start is called once before the first execution of Update after the MonoBehaviour is created
     void Start()
@@ -29,20 +35,22 @@ public class PlayerMovement : NetworkBehaviour
             tilemap = FindFirstObjectByType<Tilemap>();
         }
         
-        // Position player at starting position
-        if (boardManager != null && boardManager.GetPathPositions().Count > 0)
+        // Initialize player at starting position
+        InitializePlayerPosition();
+        
+        // Subscribe to turn changes to show path choice when game starts
+        if (TurnManager.Instance != null)
         {
-            Vector3 startPos = boardManager.GetPathPositions()[currentPathIndex.Value];
-            // Convert to world position if using cell positions
-            if (tilemap != null)
-            {
-                Vector3Int cellPos = new Vector3Int(Mathf.RoundToInt(startPos.x), Mathf.RoundToInt(startPos.y), Mathf.RoundToInt(startPos.z));
-                transform.position = tilemap.GetCellCenterWorld(cellPos);
-            }
-            else
-            {
-                transform.position = startPos;
-            }
+            StartCoroutine(WaitForGameStartAndShowChoice());
+        }
+    }
+    
+    private void InitializePlayerPosition()
+    {
+        if (boardManager != null)
+        {
+            // Don't show choice popup here - wait for game to start
+            // Players will be positioned when they make their choice
         }
     }
 
@@ -73,9 +81,6 @@ public class PlayerMovement : NetworkBehaviour
         
         if (isMoving.Value || boardManager == null) return;
         
-        var pathPositions = boardManager.GetPathPositions();
-        if (pathPositions.Count == 0) return;
-        
         // Check if player can move at least one space
         if (!CanMoveAtLeastOneSpace())
         {
@@ -84,18 +89,10 @@ public class PlayerMovement : NetworkBehaviour
             return;
         }
         
-        // Check if we're at the last index
-        if (currentPathIndex.Value >= pathPositions.Count - 1)
-        {
-            Debug.Log("Player has reached the end of the path!");
-            CheckForGameEnd();
-            return;
-        }
-        
-        // Move to next position - use ServerRpc
-        int newIndex = currentPathIndex.Value + 1;
-        UpdatePathIndexServerRpc(newIndex);
-        Vector3 targetCellPos = pathPositions[newIndex];
+        // Move to next position
+        int newIndex = currentSegmentIndex.Value + 1;
+        UpdateSegmentIndexServerRpc(newIndex);
+        Vector3 targetCellPos = GetCurrentSegmentPosition(newIndex);
         StartCoroutine(MoveToCellPositionAndEndTurn(targetCellPos));
     }
     
@@ -145,41 +142,45 @@ public class PlayerMovement : NetworkBehaviour
     /// </summary>
     private IEnumerator WaitForSpinAndMove()
     {
-        // Find SpinManager in the scene
         SpinManager spinManager = FindFirstObjectByType<SpinManager>();
-        if (spinManager == null) yield break;
+        if (spinManager == null) 
+        {
+            Debug.LogError("PlayerMovement: SpinManager not found!");
+            yield break;
+        }
         
-        // Wait for spin duration plus a small buffer
-        yield return new WaitForSeconds(spinManager.spinDuration + 0.1f);
+        Debug.Log($"PlayerMovement: Waiting for spin to complete... (IsServer: {IsServer}, IsClient: {IsClient})");
         
-        // Wait for spin to actually complete (for network synchronization)
-        float waitTime = 0f;
-        float maxWaitTime = 2f; // Maximum wait time to prevent infinite loop
+        // Wait for spin to complete
+        float timeout = 10f; // 10 second timeout
+        float elapsed = 0f;
         
-        while (!spinManager.IsSpinComplete() && waitTime < maxWaitTime)
+        while (!spinManager.IsSpinComplete() && elapsed < timeout)
         {
             yield return new WaitForSeconds(0.1f);
-            waitTime += 0.1f;
+            elapsed += 0.1f;
+            
+            if (elapsed % 1f < 0.1f) // Log every second
+            {
+                Debug.Log($"PlayerMovement: Still waiting for spin... ({elapsed:F1}s) - IsSpinComplete: {spinManager.IsSpinComplete()}");
+            }
         }
         
-        if (waitTime >= maxWaitTime)
+        if (elapsed >= timeout)
         {
-            Debug.LogWarning("SpinManager: Timeout waiting for spin to complete!");
+            Debug.LogError("PlayerMovement: Spin timeout! Using fallback result.");
         }
         
-        // Get the final spin number (1-10)
+        // Get the spin result
         int spinResult = GetSpinResult();
+        Debug.Log($"PlayerMovement: Final spin result: {spinResult} (IsServer: {IsServer}, IsClient: {IsClient})");
         
-        // Move the player based on spin result
+        // Move the player
         MoveSpaces(spinResult);
-        
-        Debug.Log($"Spin result: {spinResult}, moving {spinResult} spaces");
-        
-        // Note: Turn ending is handled in MoveMultipleSpaces() after movement completes
     }
     
     /// <summary>
-    /// Get the current spin result from the SpinManager
+    /// Get the final spin result
     /// </summary>
     private int GetSpinResult()
     {
@@ -240,6 +241,9 @@ public class PlayerMovement : NetworkBehaviour
 
         // Handle landing events and rewards
         LandingEventHandler.HandleLanding(this, tilemap);
+        
+        // Check if we landed on a stop segment and need to make a path choice
+        CheckForPathChoice();
     }
     
     /// <summary>
@@ -249,11 +253,20 @@ public class PlayerMovement : NetworkBehaviour
     {
         yield return StartCoroutine(MoveToCellPosition(targetCellPos));
         
-        // End the turn after movement completes
-        if (TurnManager.Instance != null)
+        // Check if player landed on a Stop tile - if so, they get another turn
+        if (IsOnStopTile())
         {
             yield return new WaitForSeconds(0.5f); // Small delay after movement
-            TurnManager.Instance.EndTurn();
+            HandleStopTileEffect();
+        }
+        else
+        {
+            // End the turn after movement completes
+            if (TurnManager.Instance != null)
+            {
+                yield return new WaitForSeconds(0.5f); // Small delay after movement
+                TurnManager.Instance.EndTurn();
+            }
         }
     }
     
@@ -262,6 +275,8 @@ public class PlayerMovement : NetworkBehaviour
     /// </summary>
     public void MoveSpaces(int spaces)
     {
+        Debug.Log($"PlayerMovement: MoveSpaces called with {spaces} spaces (IsServer: {IsServer}, IsClient: {IsClient})");
+        
         // Check if game has ended
         if (TurnManager.Instance != null && TurnManager.Instance.IsGameEnded())
         {
@@ -269,7 +284,11 @@ public class PlayerMovement : NetworkBehaviour
             return;
         }
         
-        if (isMoving.Value || boardManager == null || spaces <= 0) return;
+        if (isMoving.Value || boardManager == null || spaces <= 0) 
+        {
+            Debug.LogWarning($"PlayerMovement: Cannot move - isMoving: {isMoving.Value}, boardManager: {boardManager != null}, spaces: {spaces}");
+            return;
+        }
         
         // Check if player can move at least one space
         if (!CanMoveAtLeastOneSpace())
@@ -279,6 +298,7 @@ public class PlayerMovement : NetworkBehaviour
             return;
         }
         
+        Debug.Log($"PlayerMovement: Starting MoveMultipleSpaces with {spaces} spaces");
         StartCoroutine(MoveMultipleSpaces(spaces));
     }
     
@@ -287,16 +307,25 @@ public class PlayerMovement : NetworkBehaviour
     /// </summary>
     private IEnumerator MoveMultipleSpaces(int spaces)
     {
-        var pathPositions = boardManager.GetPathPositions();
+        Debug.Log($"PlayerMovement: MoveMultipleSpaces started with {spaces} spaces (IsServer: {IsServer}, IsClient: {IsClient})");
         
-        // Calculate how many spaces we can actually move
-        int maxSpaces = Mathf.Min(spaces, pathPositions.Count - 1 - currentPathIndex.Value);
+        PathSegment currentSegment = GetCurrentSegment();
+        if (currentSegment == null) 
+        {
+            Debug.LogError("PlayerMovement: Current segment is null!");
+            yield break;
+        }
         
-        Debug.Log($"Path calculation: currentIndex={currentPathIndex.Value}, pathLength={pathPositions.Count}, spaces={spaces}, maxSpaces={maxSpaces}");
+        Debug.Log($"PlayerMovement: Current segment: {currentSegment.segmentName}, length: {currentSegment.GetPathLength()}, current index: {currentSegmentIndex.Value}");
+        
+        // Calculate how many spaces we can actually move within current segment
+        int maxSpaces = Mathf.Min(spaces, currentSegment.GetPathLength() - 1 - currentSegmentIndex.Value);
+        
+        Debug.Log($"PlayerMovement: Path calculation - currentIndex={currentSegmentIndex.Value}, segmentLength={currentSegment.GetPathLength()}, spaces={spaces}, maxSpaces={maxSpaces}");
         
         if (maxSpaces <= 0)
         {
-            Debug.Log("Player has reached the end of the path!");
+            Debug.LogWarning("PlayerMovement: Cannot move further on the current segment!");
             yield break;
         }
         
@@ -306,7 +335,7 @@ public class PlayerMovement : NetworkBehaviour
         
         for (int i = 0; i < maxSpaces; i++)
         {
-            Vector3 targetCellPos = pathPositions[currentPathIndex.Value + i + 1];
+            Vector3 targetCellPos = currentSegment.GetPositionAtIndex(currentSegmentIndex.Value + i + 1);
             
             // Convert cell position to world position
             if (tilemap != null)
@@ -343,18 +372,25 @@ public class PlayerMovement : NetworkBehaviour
             yield return null;
         }
         
-        // Update current path index with safety check - use ServerRpc
-        int newIndex = currentPathIndex.Value + maxSpaces;
-        if (newIndex >= pathPositions.Count)
+        // Update current segment index with safety check
+        int newIndex = currentSegmentIndex.Value + maxSpaces;
+        if (newIndex >= currentSegment.GetPathLength())
         {
-            newIndex = pathPositions.Count - 1; // Clamp to last position
+            newIndex = currentSegment.GetPathLength() - 1; // Clamp to last position
+        }
+        
+        Debug.Log($"Moved {maxSpaces} spaces out of {spaces} requested. New index will be: {newIndex}");
+        
+        // Check for game ending conditions BEFORE updating the index
+        if (newIndex >= currentSegment.GetPathLength() - 1 && currentSegment.isEndSegment)
+        {
+            Debug.Log("Player will reach the end of the path! Checking for game end...");
+            CheckForGameEnd();
         }
         
         // Update position on server via RPC
-        UpdatePathIndexServerRpc(newIndex);
+        UpdateSegmentIndexServerRpc(newIndex);
         transform.position = targetPositions[targetPositions.Length - 1];
-        
-        Debug.Log($"Moved {maxSpaces} spaces out of {spaces} requested. New index: {currentPathIndex.Value}");
         
         // Log the color of the tile we landed on
         LogLandedTileColor();
@@ -362,23 +398,25 @@ public class PlayerMovement : NetworkBehaviour
         // Handle landing events and rewards
         LandingEventHandler.HandleLanding(this, tilemap);
         
-        // Check if we reached the end
-        if (currentPathIndex.Value >= pathPositions.Count - 1)
+        // Check for game ending conditions after movement (in case we landed on End tile)
+        CheckForGameEnd();
+        
+        Debug.Log($"Player position: {currentSegmentIndex.Value}/{currentSegment.GetPathLength() - 1}");
+        
+        // Check if player landed on a Stop tile - if so, they get another turn
+        if (IsOnStopTile())
         {
-            Debug.Log($"Player has reached the end of the path! Index: {currentPathIndex.Value}, Path length: {pathPositions.Count}");
-            // Check for game ending conditions
-            CheckForGameEnd();
+            yield return new WaitForSeconds(0.5f); // Small delay after movement
+            HandleStopTileEffect();
         }
         else
         {
-            Debug.Log($"Player position: {currentPathIndex.Value}/{pathPositions.Count - 1}");
-        }
-        
-        // End the turn after movement completes (for MoveSpaces method)
-        if (TurnManager.Instance != null && !TurnManager.Instance.IsGameEnded())
-        {
-            yield return new WaitForSeconds(0.5f); // Small delay after movement
-            TurnManager.Instance.EndTurn();
+            // End the turn after movement completes (for MoveSpaces method)
+            if (TurnManager.Instance != null && !TurnManager.Instance.IsGameEnded())
+            {
+                yield return new WaitForSeconds(0.5f); // Small delay after movement
+                TurnManager.Instance.EndTurn();
+            }
         }
     }
     
@@ -424,21 +462,227 @@ public class PlayerMovement : NetworkBehaviour
     }
     
     /// <summary>
+    /// Get the current segment the player is on
+    /// </summary>
+    private PathSegment GetCurrentSegment()
+    {
+        if (boardManager == null || currentSegmentId.Value < 0) return null;
+        
+        List<PathSegment> segments = boardManager.GetPathSegments();
+        if (currentSegmentId.Value < segments.Count)
+        {
+            return segments[currentSegmentId.Value];
+        }
+        return null;
+    }
+    
+    /// <summary>
+    /// Get position at specific index in current segment
+    /// </summary>
+    private Vector3 GetCurrentSegmentPosition(int index)
+    {
+        PathSegment segment = GetCurrentSegment();
+        if (segment != null)
+        {
+            return segment.GetPositionAtIndex(index);
+        }
+        return Vector3.zero;
+    }
+    
+    /// <summary>
+    /// Set player position in world space
+    /// </summary>
+    private void SetPlayerPosition(Vector3 position)
+    {
+        if (tilemap != null)
+        {
+            Vector3Int cellPos = new Vector3Int(Mathf.RoundToInt(position.x), Mathf.RoundToInt(position.y), Mathf.RoundToInt(position.z));
+            transform.position = tilemap.GetCellCenterWorld(cellPos);
+        }
+        else
+        {
+            transform.position = position;
+        }
+    }
+    
+    /// <summary>
+    /// Wait for game to start and show path choice on player's turn
+    /// </summary>
+    private System.Collections.IEnumerator WaitForGameStartAndShowChoice()
+    {
+        // Wait for game to start
+        while (TurnManager.Instance == null || !TurnManager.Instance.IsGameStarted())
+        {
+            yield return new WaitForSeconds(0.1f);
+        }
+        
+        // Wait for it to be this player's turn
+        while (!TurnManager.Instance.IsMyTurn())
+        {
+            yield return new WaitForSeconds(0.1f);
+        }
+        
+        // Show path choice popup only on this player's turn
+        if (boardManager != null)
+        {
+            int playerNumber = GetMyPlayerNumber();
+            boardManager.ShowPathChoicePopup(playerNumber, this);
+            SetWaitingForPathChoiceServerRpc(true);
+        }
+    }
+    
+    /// <summary>
+    /// Check if player needs to make a path choice
+    /// </summary>
+    private void CheckForPathChoice()
+    {
+        // Check if the current tile is a "Stop" tile
+        if (IsOnStopTile())
+        {
+            PathSegment currentSegment = GetCurrentSegment();
+            if (currentSegment != null && currentSegment.HasConnections())
+            {
+                // Show path choice popup
+                int playerNumber = GetMyPlayerNumber();
+                boardManager.ShowPathChoicePopup(playerNumber, this);
+                SetWaitingForPathChoiceServerRpc(true);
+            }
+        }
+    }
+    
+    /// <summary>
+    /// Check if the player is currently on a Stop tile
+    /// </summary>
+    public bool IsOnStopTile()
+    {
+        if (tilemap == null) return false;
+        
+        Vector3Int cellPosition = tilemap.WorldToCell(transform.position);
+        TileBase tile = tilemap.GetTile(cellPosition);
+        
+        if (tile != null)
+        {
+            bool isStopTile = tile.name.Contains("Stop");
+            if (isStopTile)
+            {
+                Debug.Log($"Player {GetMyPlayerNumber()} landed on Stop tile: {tile.name}");
+            }
+            return isStopTile;
+        }
+        
+        return false;
+    }
+    
+    /// <summary>
+    /// Handle the Stop tile effect - give player another turn
+    /// </summary>
+    private void HandleStopTileEffect()
+    {
+        Debug.Log($"Player {GetMyPlayerNumber()} gets another turn due to Stop tile!");
+        
+        // Add visual feedback - flash the player or show a message
+        StartCoroutine(FlashPlayerForStopTile());
+        
+        // Show path choice popup immediately for another turn
+        if (boardManager != null)
+        {
+            boardManager.ShowPathChoicePopup(GetMyPlayerNumber(), this);
+        }
+        else
+        {
+            Debug.LogWarning("BoardManager not found, cannot show path choice popup for Stop tile effect");
+        }
+    }
+    
+    /// <summary>
+    /// Visual feedback when player gets another turn from Stop tile
+    /// </summary>
+    private System.Collections.IEnumerator FlashPlayerForStopTile()
+    {
+        SpriteRenderer spriteRenderer = GetComponent<SpriteRenderer>();
+        if (spriteRenderer == null) yield break;
+        
+        Color originalColor = spriteRenderer.color;
+        Color flashColor = Color.yellow;
+        
+        // Flash 3 times
+        for (int i = 0; i < 3; i++)
+        {
+            spriteRenderer.color = flashColor;
+            yield return new WaitForSeconds(0.2f);
+            spriteRenderer.color = originalColor;
+            yield return new WaitForSeconds(0.2f);
+        }
+    }
+    
+    /// <summary>
+    /// Called when player makes a path choice
+    /// </summary>
+    public void OnPathChoiceMade(PathConnection chosenConnection)
+    {
+        if (boardManager == null) return;
+        
+        // Find the target segment by name
+        List<PathSegment> segments = boardManager.GetPathSegments();
+        int targetSegmentId = -1;
+        PathSegment targetSegment = null;
+        
+        for (int i = 0; i < segments.Count; i++)
+        {
+            if (segments[i].segmentName == chosenConnection.targetSegmentName)
+            {
+                targetSegmentId = i;
+                targetSegment = segments[i];
+                break;
+            }
+        }
+        
+        if (targetSegment == null)
+        {
+            Debug.LogError($"Target segment '{chosenConnection.targetSegmentName}' not found!");
+            return;
+        }
+        
+        // Update player's path data
+        PlayerPathData newPathData = new PlayerPathData(chosenConnection.targetSegmentName, chosenConnection.entryPointIndex);
+        newPathData.pathHistory = new System.Collections.Generic.List<string>();
+        
+        // Add current segment to history
+        if (currentSegmentId.Value >= 0 && currentSegmentId.Value < segments.Count)
+        {
+            newPathData.pathHistory.Add(segments[currentSegmentId.Value].segmentName);
+        }
+        
+        // Update on server
+        boardManager.SetPlayerPathServerRpc(GetMyPlayerNumber(), newPathData);
+        
+        // Update local variables
+        SetSegmentDataServerRpc(targetSegmentId, chosenConnection.entryPointIndex);
+        SetWaitingForPathChoiceServerRpc(false);
+        
+        // Move player to new position
+        Vector3 newPosition = targetSegment.GetPositionAtIndex(chosenConnection.entryPointIndex);
+        SetPlayerPosition(newPosition);
+        
+        Debug.Log($"Player chose path: {chosenConnection.targetSegmentName} at index {chosenConnection.entryPointIndex}");
+    }
+    
+    /// <summary>
     /// Get the current position index on the path
     /// </summary>
     public int GetCurrentPathIndex()
     {
-        return currentPathIndex.Value;
+        return currentSegmentIndex.Value;
     }
     
     /// <summary>
-    /// Check if player has reached the end of the path
+    /// Check if player has reached the end of the current segment
     /// </summary>
     public bool HasReachedEnd()
     {
-        if (boardManager == null) return false;
-        var pathPositions = boardManager.GetPathPositions();
-        return currentPathIndex.Value >= pathPositions.Count - 1;
+        PathSegment currentSegment = GetCurrentSegment();
+        if (currentSegment == null) return false;
+        return currentSegmentIndex.Value >= currentSegment.GetPathLength() - 1 && currentSegment.isEndSegment;
     }
     
     /// <summary>
@@ -446,25 +690,15 @@ public class PlayerMovement : NetworkBehaviour
     /// </summary>
     public void SetCurrentPathIndex(int index)
     {
-        if (boardManager == null) return;
+        PathSegment currentSegment = GetCurrentSegment();
+        if (currentSegment == null) return;
         
-        var pathPositions = boardManager.GetPathPositions();
-        if (index >= 0 && index < pathPositions.Count)
+        if (index >= 0 && index < currentSegment.GetPathLength())
         {
             // Use ServerRpc to update the index
-            UpdatePathIndexServerRpc(index);
-            Vector3 targetCellPos = pathPositions[index];
-            
-            // Convert to world position if using cell positions
-            if (tilemap != null)
-            {
-                Vector3Int cellPos = new Vector3Int(Mathf.RoundToInt(targetCellPos.x), Mathf.RoundToInt(targetCellPos.y), Mathf.RoundToInt(targetCellPos.z));
-                transform.position = tilemap.GetCellCenterWorld(cellPos);
-            }
-            else
-            {
-                transform.position = targetCellPos;
-            }
+            UpdateSegmentIndexServerRpc(index);
+            Vector3 targetCellPos = currentSegment.GetPositionAtIndex(index);
+            SetPlayerPosition(targetCellPos);
         }
     }
     
@@ -481,13 +715,33 @@ public class PlayerMovement : NetworkBehaviour
     }
     
     /// <summary>
-    /// ServerRpc to update the path index (only server can modify NetworkVariables)
+    /// ServerRpc to update the segment index (only server can modify NetworkVariables)
     /// </summary>
-    [ServerRpc]
-    private void UpdatePathIndexServerRpc(int newIndex)
+    [ServerRpc(RequireOwnership = false)]
+    private void UpdateSegmentIndexServerRpc(int newIndex)
     {
-        currentPathIndex.Value = newIndex;
-        Debug.Log($"Server: Updated player path index to {newIndex}");
+        currentSegmentIndex.Value = newIndex;
+        Debug.Log($"Server: Updated player segment index to {newIndex}");
+    }
+    
+    /// <summary>
+    /// ServerRpc to set segment data
+    /// </summary>
+    [ServerRpc(RequireOwnership = false)]
+    private void SetSegmentDataServerRpc(int segmentId, int index)
+    {
+        currentSegmentId.Value = segmentId;
+        currentSegmentIndex.Value = index;
+        Debug.Log($"Server: Updated player segment to ID {segmentId} at index {index}");
+    }
+    
+    /// <summary>
+    /// ServerRpc to set waiting for path choice state
+    /// </summary>
+    [ServerRpc(RequireOwnership = false)]
+    private void SetWaitingForPathChoiceServerRpc(bool waiting)
+    {
+        waitingForPathChoice.Value = waiting;
     }
     
     /// <summary>
@@ -497,50 +751,82 @@ public class PlayerMovement : NetworkBehaviour
     {
         if (TurnManager.Instance == null || TurnManager.Instance.IsGameEnded()) return;
         
-        // Check if this player has reached the end
+        // Check if this player has reached the end of the path
         if (HasReachedEnd())
         {
-            int myPlayerNumber = GetMyPlayerNumber();
-            Debug.Log($"Player {myPlayerNumber} has reached the end! Game Over!");
-            TurnManager.Instance.EndGame(myPlayerNumber);
+            Debug.Log("A player has reached the end of the path! Requesting server to determine winner...");
+            RequestGameEndServerRpc();
             return;
         }
         
-        // Check if the other player has reached the end
-        PlayerMovement[] allPlayers = FindObjectsByType<PlayerMovement>(FindObjectsSortMode.None);
-        foreach (var player in allPlayers)
+        // Check if this player landed on the End tile (regardless of position)
+        if (IsOnEndTile())
         {
-            if (player != this && player.HasReachedEnd())
+            Debug.Log("A player landed on the End tile! Requesting server to determine winner...");
+            RequestGameEndServerRpc();
+            return;
+        }
+        
+        // Check if any player has gone bankrupt (negative money)
+        PlayerMovement[] allPlayers = FindObjectsByType<PlayerMovement>(FindObjectsSortMode.None);
+        for (int i = 0; i < allPlayers.Length; i++)
+        {
+            PlayerInventory inventory = allPlayers[i].GetComponent<PlayerInventory>();
+            if (inventory != null && inventory.GetMoney() < 0)
             {
-                int otherPlayerNumber = player.GetMyPlayerNumber();
-                Debug.Log($"Other player {otherPlayerNumber} has reached the end! Game Over!");
-                TurnManager.Instance.EndGame(otherPlayerNumber);
+                // Find the other player (the winner)
+                int winnerNumber = 0;
+                for (int j = 0; j < allPlayers.Length; j++)
+                {
+                    if (j != i)
+                    {
+                        winnerNumber = allPlayers[j].GetMyPlayerNumber();
+                        break;
+                    }
+                }
+                Debug.Log($"Player {allPlayers[i].GetMyPlayerNumber()} went bankrupt! Player {winnerNumber} wins!");
+                TurnManager.Instance.EndGame(winnerNumber);
                 return;
             }
         }
+    }
+    
+    /// <summary>
+    /// Check if the player is currently on an End tile
+    /// </summary>
+    private bool IsOnEndTile()
+    {
+        if (tilemap == null) return false;
         
-        // Check if both players can't move anymore (optional - for tie scenarios)
-        bool canAnyPlayerMove = false;
-        foreach (var player in allPlayers)
+        Vector3Int cellPosition = tilemap.WorldToCell(transform.position);
+        TileBase tile = tilemap.GetTile(cellPosition);
+        
+        if (tile != null)
         {
-            if (player.CanMoveAtLeastOneSpace())
-            {
-                canAnyPlayerMove = true;
-                break;
-            }
+            return tile.name.Contains("End");
         }
         
-        if (!canAnyPlayerMove)
+        return false;
+    }
+    
+    /// <summary>
+    /// ServerRpc to request game end
+    /// </summary>
+    [ServerRpc(RequireOwnership = false)]
+    private void RequestGameEndServerRpc()
+    {
+        if (TurnManager.Instance != null)
         {
-            Debug.Log("No player can move anymore! It's a tie!");
-            TurnManager.Instance.EndGame(0); // 0 = tie
+            // Determine winner based on player numbers
+            int winnerNumber = GetMyPlayerNumber();
+            TurnManager.Instance.EndGame(winnerNumber);
         }
     }
     
     /// <summary>
     /// Get the current player number (1 for host, 2 for client)
     /// </summary>
-    private int GetMyPlayerNumber()
+    public int GetMyPlayerNumber()
     {
         if (NetworkManager.Singleton == null) return 0;
         return NetworkManager.Singleton.IsHost ? 1 : 2;
@@ -551,9 +837,9 @@ public class PlayerMovement : NetworkBehaviour
     /// </summary>
     public bool CanMoveAtLeastOneSpace()
     {
-        if (boardManager == null) return false;
-        var pathPositions = boardManager.GetPathPositions();
-        return currentPathIndex.Value < pathPositions.Count - 1;
+        PathSegment currentSegment = GetCurrentSegment();
+        if (currentSegment == null) return false;
+        return currentSegmentIndex.Value < currentSegment.GetPathLength() - 1;
     }
     
     /// <summary>
@@ -576,5 +862,4 @@ public class PlayerMovement : NetworkBehaviour
             Debug.Log("Player landed on empty space");
         }
     }
-    
 }

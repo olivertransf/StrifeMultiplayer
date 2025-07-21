@@ -113,10 +113,37 @@ public class TurnManager : NetworkBehaviour
         // Update player numbers when a new client connects
         InitializePlayerNumbers();
         
-        // If we're the host and now have both players, start the game
-        if (IsHost && NetworkManager.Singleton.ConnectedClients.Count >= 2)
+        // If we're the host and now have both players, wait a bit for spawning to complete
+        if (IsHost && NetworkManager.Singleton.ConnectedClients.Count >= 2 && !isGameStarted.Value)
         {
-            StartGameServerRpc();
+            StartCoroutine(WaitForBothPlayersAndStartGame());
+        }
+        // If game is already started, initialize the new player's inventory
+        else if (isGameStarted.Value)
+        {
+            InitializeNewPlayerInventory(clientId);
+        }
+    }
+    
+    /// <summary>
+    /// Initialize inventory for a new player joining after game start
+    /// </summary>
+    private void InitializeNewPlayerInventory(ulong clientId)
+    {
+        if (GameInitializer.Instance == null) return;
+        
+        // Find the player object for this client
+        if (NetworkManager.Singleton.ConnectedClients.TryGetValue(clientId, out var client))
+        {
+            if (client.PlayerObject != null)
+            {
+                PlayerInventory inventory = client.PlayerObject.GetComponent<PlayerInventory>();
+                if (inventory != null)
+                {
+                    Debug.Log($"TurnManager: Initializing inventory for late-joining player {clientId}");
+                    GameInitializer.Instance.InitializePlayerInventory(inventory);
+                }
+            }
         }
     }
     
@@ -148,8 +175,31 @@ public class TurnManager : NetworkBehaviour
             yield return new WaitForSeconds(0.5f);
         }
         
-        // Both players are connected, start the game
-        StartGameServerRpc();
+        // Wait a bit more for player spawning to complete
+        Debug.Log("TurnManager: Both players connected, waiting for spawning to complete...");
+        yield return new WaitForSeconds(1f);
+        
+        // Check if both players have spawned
+        int spawnedPlayers = 0;
+        foreach (var client in NetworkManager.Singleton.ConnectedClients.Values)
+        {
+            if (client.PlayerObject != null)
+            {
+                spawnedPlayers++;
+            }
+        }
+        
+        Debug.Log($"TurnManager: {spawnedPlayers}/{NetworkManager.Singleton.ConnectedClients.Count} players have spawned");
+        
+        // Both players are connected and spawned, start the game
+        if (!isGameStarted.Value)
+        {
+            StartGameServerRpc();
+        }
+        else
+        {
+            Debug.LogWarning("TurnManager: Game already started, skipping StartGameServerRpc");
+        }
     }
     
     private void OnTurnChanged(int previousValue, int newValue)
@@ -167,10 +217,15 @@ public class TurnManager : NetworkBehaviour
     
     private void OnGameEndedChanged(bool previousValue, bool newValue)
     {
+        Debug.Log($"OnGameEndedChanged: {previousValue} -> {newValue}, Winner: {winningPlayer.Value}, IsServer: {IsServer}, IsClient: {IsClient}");
+        
         if (newValue)
         {
             Debug.Log($"Game ended! Winner: Player {winningPlayer.Value}");
             UpdateTurnUI();
+            
+            // Show game end action popup
+            ShowGameEndAction();
         }
     }
     
@@ -265,14 +320,14 @@ public class TurnManager : NetworkBehaviour
         EndTurnServerRpc();
     }
     
-    private GameObject FindLocalPlayer()
+    private PlayerMovement FindLocalPlayer()
     {
         if (NetworkManager.Singleton == null) return null;
         
         var localClient = NetworkManager.Singleton.LocalClient;
         if (localClient != null && localClient.PlayerObject != null)
         {
-            return localClient.PlayerObject.gameObject;
+            return localClient.PlayerObject.GetComponent<PlayerMovement>();
         }
         
         return null;
@@ -297,6 +352,77 @@ public class TurnManager : NetworkBehaviour
         isGameStarted.Value = true;
         currentTurnPlayer.Value = 1; // Host starts first
         Debug.Log("Game started! Host goes first.");
+        
+        // Initialize all player inventories when the game starts
+        InitializeAllPlayerInventories();
+    }
+    
+    /// <summary>
+    /// Initialize all player inventories when the game starts
+    /// </summary>
+    private void InitializeAllPlayerInventories()
+    {
+        if (GameInitializer.Instance == null)
+        {
+            Debug.LogWarning("TurnManager: GameInitializer not found, cannot initialize player inventories");
+            return;
+        }
+        
+        // Ensure GameInitializer is properly initialized on server
+        if (!GameInitializer.Instance.isInitialized)
+        {
+            Debug.Log("TurnManager: Forcing GameInitializer initialization on server");
+            GameInitializer.Instance.InitializeGame();
+        }
+        
+        Debug.Log($"TurnManager: Starting inventory initialization for {NetworkManager.Singleton.ConnectedClients.Count} players");
+        
+        // Tell all clients to initialize their own inventories
+        InitializePlayerInventoriesClientRpc();
+    }
+    
+    /// <summary>
+    /// ClientRpc to tell all clients to initialize their own inventories
+    /// </summary>
+    [ClientRpc]
+    private void InitializePlayerInventoriesClientRpc()
+    {
+        Debug.Log("TurnManager: Initializing player inventories on client");
+        
+        // Find the local player object
+        PlayerMovement localPlayer = FindLocalPlayer();
+        if (localPlayer != null)
+        {
+            PlayerInventory inventory = localPlayer.GetComponent<PlayerInventory>();
+            if (inventory != null)
+            {
+                int playerNumber = NetworkManager.Singleton.IsHost ? 1 : 2;
+                Debug.Log($"TurnManager: Client initializing inventory for player {playerNumber}");
+                
+                // Ensure GameInitializer is properly initialized
+                if (GameInitializer.Instance != null)
+                {
+                    // Force initialization if not already done
+                    if (!GameInitializer.Instance.isInitialized)
+                    {
+                        GameInitializer.Instance.InitializeGame();
+                    }
+                    GameInitializer.Instance.InitializePlayerInventory(inventory);
+                }
+                else
+                {
+                    Debug.LogError("TurnManager: GameInitializer.Instance is null!");
+                }
+            }
+            else
+            {
+                Debug.LogWarning($"TurnManager: PlayerInventory component not found on local player object");
+            }
+        }
+        else
+        {
+            Debug.LogWarning($"TurnManager: Local player object not found");
+        }
     }
     
     [ServerRpc(RequireOwnership = false)]
@@ -394,4 +520,53 @@ public class TurnManager : NetworkBehaviour
     {
         return winningPlayer.Value;
     }
+    
+    // Show the game end action popup
+    private void ShowGameEndAction()
+    {
+        Debug.Log($"ShowGameEndAction called - Winner: {winningPlayer.Value}, IsServer: {IsServer}, IsClient: {IsClient}");
+        
+        if (GameInitializer.Instance != null && ActionManager.Instance != null)
+        {
+            // Get the game end action based on the winner
+            ActionData gameEndAction = GameInitializer.Instance.GetGameEndAction(winningPlayer.Value);
+            Debug.Log($"Created game end action: {gameEndAction?.title}");
+            
+            // Show the game end popup on all clients
+            ShowGameEndPopupClientRpc(gameEndAction);
+            Debug.Log("ShowGameEndPopupClientRpc called");
+        }
+        else
+        {
+            Debug.LogWarning($"Cannot create game end action - GameInitializer: {GameInitializer.Instance != null}, ActionManager: {ActionManager.Instance != null}");
+        }
+    }
+    
+    [ClientRpc]
+    private void ShowGameEndPopupClientRpc(ActionData gameEndAction)
+    {
+        Debug.Log($"ClientRpc received: ShowGameEndPopupClientRpc - Winner: {winningPlayer.Value}, Action: {gameEndAction?.title}");
+        
+        // Find the local player to show the popup to
+        PlayerMovement localPlayer = FindLocalPlayer();
+        if (localPlayer != null)
+        {
+            PlayerInventory playerInventory = localPlayer.GetComponent<PlayerInventory>();
+            if (playerInventory != null && ActionManager.Instance != null)
+            {
+                Debug.Log($"Showing game end popup to local player");
+                // Show the game end action popup
+                ActionManager.Instance.ShowActionPopup(gameEndAction, playerInventory);
+            }
+            else
+            {
+                Debug.LogWarning($"Cannot show popup - PlayerInventory: {playerInventory != null}, ActionManager: {ActionManager.Instance != null}");
+            }
+        }
+        else
+        {
+            Debug.LogWarning("Local player not found for game end popup");
+        }
+    }
+    
 } 
